@@ -1,70 +1,90 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import List
 import tenseal as ts
-import requests
 import base64
-import json
+import requests
+from fastapi.middleware.cors import CORSMiddleware
 
-# -------------------------------
-# Create TenSEAL context (CLIENT)
-# -------------------------------
-context = ts.context(
-    ts.SCHEME_TYPE.CKKS,
-    poly_modulus_degree=8192,
-    coeff_mod_bit_sizes=[60, 40, 40, 60],
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-context.generate_galois_keys()
-context.global_scale = 2**40
 
-# -------------------------------
-# Serialize PUBLIC context only
-# -------------------------------
-context_bytes = context.serialize(
-    save_secret_key=False,
-    save_galois_keys=True,
-    save_relin_keys=True
-)
+BACKEND_URL = "http://127.0.0.1:8000/compute"
 
-context_b64 = base64.b64encode(context_bytes).decode("utf-8")
+# -------------------------
+# Encryption helpers
+# -------------------------
 
-# -------------------------------
-# Encrypt data
-# -------------------------------
-values = [45, 130, 210]
-encrypted_vectors = []
 
-for v in values:
-    vec = ts.ckks_vector(context, [float(v)])
-    encrypted_vectors.append(
-        base64.b64encode(vec.serialize()).decode("utf-8")
+def create_context():
+    context = ts.context(
+        ts.SCHEME_TYPE.CKKS,
+        poly_modulus_degree=8192,
+        coeff_mod_bit_sizes=[60, 40, 40, 60],
     )
+    context.generate_galois_keys()
+    context.generate_relin_keys()
+    context.global_scale = 2**40
+    return context
 
-# -------------------------------
-# Build payload
-# -------------------------------
-payload = {
-    "context": context_b64,
-    "encrypted_vectors": encrypted_vectors,
-    "operation": "average"   # 🔁 change to "sum" if needed
-}
 
-# -------------------------------
-# Send request to backend
-# -------------------------------
-response = requests.post(
-    "http://127.0.0.1:8000/compute",
-    data=json.dumps(payload),
-    headers={"Content-Type": "application/json"},
-    timeout=5
-)
+def encrypt_values(context, values):
+    encrypted = []
+    for v in values:
+        enc = ts.ckks_vector(context, [v])
+        encrypted.append(base64.b64encode(enc.serialize()).decode())
+    return encrypted
 
-# -------------------------------
-# Handle response
-# -------------------------------
-data = response.json()
 
-encrypted_result_bytes = base64.b64decode(data["encrypted_result"])
-encrypted_result_vec = ts.ckks_vector_from(context, encrypted_result_bytes)
-result = encrypted_result_vec.decrypt()[0]
+def decrypt_result(context, encrypted_result):
+    raw = base64.b64decode(encrypted_result)
+    vec = ts.ckks_vector_from(context, raw)
+    return vec.decrypt()[0]
 
-print("Plain values:", values)
-print("Decrypted result from backend:", result)
+# -------------------------
+# API models
+# -------------------------
+
+
+class AnalyzeRequest(BaseModel):
+    values: List[float]
+    operation: str  # "sum" or "average"
+
+
+class AnalyzeResponse(BaseModel):
+    result: float
+
+# -------------------------
+# API endpoint
+# -------------------------
+
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+def analyze(req: AnalyzeRequest):
+    context = create_context()
+
+    encrypted_vectors = encrypt_values(context, req.values)
+
+    payload = {
+        "context": base64.b64encode(
+            context.serialize(save_secret_key=False)
+        ).decode(),
+        "encrypted_vectors": encrypted_vectors,
+        "operation": req.operation,
+    }
+
+    response = requests.post(BACKEND_URL, json=payload)
+    response.raise_for_status()
+
+    encrypted_result = response.json()["encrypted_result"]
+    result = decrypt_result(context, encrypted_result)
+
+    return {"result": result}
